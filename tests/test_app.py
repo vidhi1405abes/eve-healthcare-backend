@@ -122,3 +122,22 @@ def test_logs_written_inside_services_carry_the_request_id(client, catalog, user
 
     lines = [json.loads(line) for line in stream.getvalue().splitlines()]
     assert any(line["message"] == "booking_created" and line["request_id"] == "trace-42" for line in lines)
+
+
+def test_health_returns_503_when_the_database_is_unreachable():
+    from sqlalchemy.exc import OperationalError
+
+    from app.db.session import get_db
+
+    class BrokenSession:
+        def execute(self, *args, **kwargs):
+            raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    app.dependency_overrides[get_db] = lambda: BrokenSession()
+    try:
+        response = TestClient(app).get("/health")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "service_unavailable"
