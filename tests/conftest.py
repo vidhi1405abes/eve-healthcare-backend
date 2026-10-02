@@ -34,7 +34,7 @@ from app.core.rate_limit import auth_limiter
 from app.db.session import SessionLocal, engine
 from app.main import app
 from app.models import Centre, CentreTest, DiagnosticTest, User
-from tests.helpers import auth
+from tests.helpers import auth, future_iso
 
 from decimal import Decimal
 
@@ -120,3 +120,17 @@ def catalog(db) -> SimpleNamespace:
     db.add(CentreTest(centre_id=centre.id, test_id=test.id, price=Decimal("500.00")))
     db.commit()
     return SimpleNamespace(centre_id=centre.id, test_id=test.id, price=Decimal("500.00"))
+
+
+@pytest.fixture
+def book(client, catalog):
+    def _book(headers, **overrides):
+        payload = {
+            "centre_id": catalog.centre_id,
+            "test_id": catalog.test_id,
+            "appointment_datetime": future_iso(),
+            **overrides,
+        }
+        return client.post("/bookings/", json=payload, headers=headers)
+
+    return _book

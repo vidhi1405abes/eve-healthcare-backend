@@ -3,7 +3,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.api import auth, centres, tests
+from app.api import auth, bookings, centres, tests
 from app.core.config import settings
 from app.core.exceptions import ServiceUnavailableError, register_exception_handlers
 from app.core.logging import configure_logging
@@ -28,6 +28,7 @@ register_exception_handlers(app)
 app.include_router(auth.router)
 app.include_router(centres.router)
 app.include_router(tests.router)
+app.include_router(bookings.router)
 
 
 @app.get("/health", tags=["health"], summary="Liveness/readiness check (also pings the database)")
