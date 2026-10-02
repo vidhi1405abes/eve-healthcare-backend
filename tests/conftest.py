@@ -134,3 +134,17 @@ def book(client, catalog):
         return client.post("/bookings/", json=payload, headers=headers)
 
     return _book
+
+
+@pytest.fixture
+def pay(client):
+    def _pay(headers, booking_id, outcome="SUCCESS", key=None, **extra):
+        body = {"booking_id": booking_id, **extra}
+        if outcome is not None:
+            body["simulate_outcome"] = outcome
+        request_headers = dict(headers)
+        if key is not None:
+            request_headers["Idempotency-Key"] = key
+        return client.post("/payments/", json=body, headers=request_headers)
+
+    return _pay
