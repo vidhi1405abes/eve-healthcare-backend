@@ -8,3 +8,4 @@ __pycache__/
 .idea/
 .vscode/
 webhook_body.json
+dump.rdb
