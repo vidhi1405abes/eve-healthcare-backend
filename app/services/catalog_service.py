@@ -2,7 +2,7 @@ from decimal import Decimal
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload, selectinload
+from sqlalchemy.orm import Session, selectinload
 
 from app.core.exceptions import ConflictError, NotFoundError
 from app.models import Centre, CentreTest, DiagnosticTest
