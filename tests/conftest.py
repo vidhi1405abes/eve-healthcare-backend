@@ -24,6 +24,7 @@ os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-test-jwt-secret-0123456789"
 os.environ["WEBHOOK_SECRET"] = "test-webhook-secret"
 os.environ["BCRYPT_ROUNDS"] = "4"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+os.environ["LOG_LEVEL"] = "WARNING"
 
 import pytest
 from alembic import command
