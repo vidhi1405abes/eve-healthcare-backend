@@ -48,15 +48,18 @@ Rules I followed everywhere (say these in the interview):
 | Error format | `core/exceptions.py` | `tests/test_app.py` |
 | JSON logs + request id | `core/logging.py`, `core/middleware.py` | `tests/test_app.py` |
 | Rate limiting | `core/rate_limit.py`, used in `api/auth.py` | `test_auth.py` |
-| Migrations | `alembic/versions/0001_initial_schema.py`, `alembic/env.py` | `tests/test_migrations.py` |
-| Docker | `Dockerfile`, `docker-compose.yml` | (not run in the build environment) |
+| Redis cache (centre list/detail) | `core/cache.py`, `api/centres.py` (`_cached`), invalidation in `catalog_service._commit_or_conflict` | `tests/test_cache.py` |
+| Failed webhooks stored + retried | `models/webhook_failure.py`, `services/webhook_failure_service.py`, `worker.py` (`retry_webhook`), `api/payments.py` | `tests/test_webhook_failures.py` |
+| Expire stale pending payments | `services/maintenance_service.py`, `worker.py` (`expire_stale_payments`, beat schedule) | `tests/test_maintenance.py` |
+| Migrations | `alembic/versions/0001_initial_schema.py`, `0002_webhook_failures.py`, `alembic/env.py` | `tests/test_migrations.py` |
+| Docker (db, redis, api, worker, beat) | `Dockerfile`, `docker-compose.yml` | not covered by tests |
 
 ---
 
 ## File by file
 
 ### `app/main.py`
-Creates the FastAPI app, adds the request-id middleware, registers the error handlers and the five routers, and defines
+Creates the FastAPI app, adds the request-id middleware, registers the error handlers and the routers, and defines
 `GET /health` (does `SELECT 1`; returns 503 if the database is down). Logging is configured here at start-up.
 
 ### `app/core/`
@@ -66,6 +69,7 @@ Creates the FastAPI app, adds the request-id middleware, registers the error han
 * **`logging.py`** - JSON formatter; every line includes the request id (from a context variable) and any `extra={...}` fields.
 * **`middleware.py`** - gives each request an id (or uses the incoming `X-Request-ID`), logs one `request_completed` line, returns the id in a response header.
 * **`rate_limit.py`** - small in-memory sliding-window limiter used as a dependency on signup/login.
+* **`cache.py`** - Redis wrapper. Keys include a "catalog version"; `invalidate_catalog()` bumps it. Every method swallows Redis errors and acts like a cache miss, so Redis being down never breaks the API.
 
 ### `app/db/`
 * **`base.py`** - SQLAlchemy `Base` with a naming convention so constraint names are predictable in migrations.
@@ -87,13 +91,16 @@ so a huge id gives a clean 422 instead of a database overflow.
 * **`booking_service.py`** - create (looks up the price, snapshots it, checks "offered" and "in the future"), list, get (owner-scoped), cancel. `get_booking(for_update=True)` takes a row lock.
 * **`payment_service.py`** - locks the booking, handles `Idempotency-Key` replays, checks the booking is payable, creates the payment (amount copied from booking), applies SUCCESS/FAILED/PENDING.
 * **`webhook_service.py`** - lock payment -> insert event -> lock booking -> apply or ignore -> commit. Duplicate = unique violation = `already_processed`.
+* **`webhook_failure_service.py`** - saves a webhook that failed (payment not visible yet, or unexpected error) in its own transaction, schedules the Celery retry, and `retry_failure()` re-runs `process_webhook()`.
+* **`maintenance_service.py`** - `expire_stale_pending_payments()`: fails payments stuck in `PENDING` and their bookings.
 
 ### `app/api/`
 `auth.py`, `centres.py`, `tests.py`, `bookings.py`, `payments.py` (payment **and** webhook), `deps.py` (current user, admin, pagination, `IdPath`),
 `docs.py` (helper that documents error responses in Swagger).
 
 ### Other
-* **`alembic/`** - `env.py` reads `DATABASE_URL` from the environment; `versions/0001_initial_schema.py` creates everything (and drops the enum types on downgrade).
+* **`app/worker.py`** - the Celery app: task `retry_webhook` (exponential backoff), task `expire_stale_payments`, and the beat schedule (every 5 minutes). Tasks only open a session and call a service function.
+* **`alembic/`** - `env.py` reads `DATABASE_URL` from the environment; `0001_initial_schema.py` creates the core tables (and drops the enum types on downgrade); `0002_webhook_failures.py` adds `webhook_failures`.
 * **`scripts/seed.py`** - sample data + admin; **`scripts/sign_webhook.py`** - builds a signed webhook request.
 * **`tests/conftest.py`** - test database setup and shared fixtures (`client`, `db`, `user_headers`, `admin_headers`, `catalog`, `book`, `pay`).
 
@@ -105,7 +112,7 @@ so a huge id gives a clean 422 instead of a database overflow.
 Both requests try to lock the same payment row (`SELECT ... FOR UPDATE`); one wins, the other waits. The winner inserts the
 `webhook_events` row, updates the payment and booking, and commits. The loser then gets the lock, tries to insert the same `event_id`,
 and the `UNIQUE` constraint rejects it, so it rolls back and answers `200 {"status":"already_processed"}`. Result: one event row, one state change.
-Even if the lock were missing, the unique constraint alone would still stop the duplicate (I checked this by removing the lock in a test run); the lock is what protects against *different* events racing.
+Even without the lock, the unique constraint alone would still stop the duplicate; the lock is what protects against *different* events racing (removing it makes the conflicting-events test fail while the duplicate-delivery test keeps passing).
 
 **2. How would you add a new booking status, e.g. `COMPLETED`?**
 (a) Add it to `BookingStatus` in `models/enums.py`. (b) Add its row to `ALLOWED_TRANSITIONS` in `services/booking_state.py`, e.g. `CONFIRMED -> {COMPLETED}` and `COMPLETED: set()`. (c) Write a migration by hand: Alembic's autogenerate does **not** detect new PostgreSQL enum values, so use `op.execute("ALTER TYPE booking_status ADD VALUE 'COMPLETED'")` inside `with op.get_context().autocommit_block():`. (d) Update `tests/test_state_machine.py` (its `ALLOWED` list; the "every status has an entry" test fails until you do step b, which is the safety net). (e) Add an endpoint/service function that performs the transition via `change_status()`.
@@ -134,6 +141,12 @@ I first did it the other way round and my concurrency test hit a PostgreSQL **de
 **10. Why test against real PostgreSQL instead of SQLite, and how are tests isolated?**
 Row locks (`FOR UPDATE`) and unique-constraint races are PostgreSQL behaviour; SQLite cannot test them. The test database is built by running the real Alembic migration (so migrations are tested too) and truncated before every test; the setup refuses to run unless the DB name ends with `_test`, so it can never wipe the dev database.
 
+**11. How does your Redis cache stay correct, and what if Redis dies?**
+Cache keys contain a version number stored in Redis (`catalog:version`). Any admin write (create/update centre, change a price, rename a test) bumps the version after the database commit, so every older key becomes unreachable and expires on its own; I never hunt for individual keys. If Redis is unreachable, `Cache` catches the error and behaves like a miss, so requests still hit PostgreSQL; short socket timeouts stop a dead Redis from slowing the API. Only the public centre endpoints are cached; bookings and payments never are.
+
+**12. What do the Celery tasks do, and why is retrying a webhook safe?**
+`retry_webhook` re-runs a webhook we saved in `webhook_failures` (payment not visible yet, or an unexpected error) with exponential backoff, up to a maximum number of retries. It calls the same `process_webhook()` as the HTTP endpoint, which is idempotent (unique `event_id`, locks), so even if the provider's own retry arrives at the same time nothing is applied twice. `expire_stale_payments` runs from Celery beat every 5 minutes and fails payments stuck in `PENDING` so the user can pay again.
+
 ---
 
 ## Small live changes an interviewer might ask for
@@ -161,4 +174,7 @@ Row locks (`FOR UPDATE`) and unique-constraint races are PostgreSQL behaviour; S
 * `tests/test_webhook.py`: send an event with `timestamp` 10 minutes old (the `webhook_body(..., timestamp=...)` helper accepts overrides) and expect 4xx; existing tests keep passing because they use "now".
 
 **Bonus: "Add a `name` filter to `GET /centres/`."**
-`app/api/centres.py` (new `Query` parameter) -> `catalog_service.list_centres` (another `.where(Centre.name.ilike(...))`, reuse `_contains_pattern`) -> `tests/test_catalog.py`.
+`app/api/centres.py` (new `Query` parameter, and add it to the `cache.key(...)` call so filtered results are cached separately) -> `catalog_service.list_centres` (another `.where(Centre.name.ilike(...))`, reuse `_contains_pattern`) -> `tests/test_catalog.py` and `tests/test_cache.py`.
+
+**Bonus: "Change the cache lifetime / the payment timeout."**
+Configuration only: `CACHE_TTL_SECONDS` or `PAYMENT_PENDING_TIMEOUT_MINUTES` in `.env` (read in `app/core/config.py`).

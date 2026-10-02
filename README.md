@@ -3,7 +3,7 @@
 Backend for booking diagnostic tests at diagnostic centres, with a **simulated** payment provider and an
 **idempotent, signed payment webhook**. Built for the EVE Healthcare SDE Intern backend assignment.
 
-**Stack:** Python 3.11+ · FastAPI · SQLAlchemy 2.0 · Alembic · Pydantic v2 · PostgreSQL 16 · JWT (PyJWT) ·
+**Stack:** Python 3.11+ · FastAPI · SQLAlchemy 2.0 · Alembic · Pydantic v2 · PostgreSQL 16 · Redis · Celery · JWT (PyJWT) ·
 bcrypt · pytest · Docker / docker-compose · Swagger UI (built into FastAPI).
 
 **What it does**
@@ -15,6 +15,8 @@ bcrypt · pytest · Docker / docker-compose · Swagger UI (built into FastAPI).
 | Bookings | Server-side price snapshot, future-date + "centre offers test" validation, state machine, owner-only access |
 | Payments | `POST /payments/` simulated outcome, optional `Idempotency-Key`, retry after failure |
 | Webhook | `POST /payments/webhook/` - HMAC-signed, idempotent, race-safe, respects the state machine |
+| Redis cache | Centre list and detail are cached; admin writes invalidate the cache; the API works without Redis |
+| Celery | Failed webhooks are stored and retried with exponential backoff; a periodic job fails stale `PENDING` payments |
 | Ops | JSON logs + request id, error format, health check, Docker with healthchecks, migrations on startup |
 
 Interactive docs: **http://localhost:8000/docs** (Swagger UI) and `/redoc`.
@@ -42,21 +44,23 @@ Generate a strong secret with `python -c "import secrets; print(secrets.token_ur
 ```powershell
 docker compose up --build          # PowerShell and bash are identical
 ```
-This starts PostgreSQL (with a healthcheck) and the API. The API container waits for the database to be healthy,
-runs `alembic upgrade head`, then serves on port 8000.
+This starts five services: PostgreSQL and Redis (both with healthchecks), the API, a Celery worker and Celery beat.
+The API container waits for the database and Redis to be healthy, runs `alembic upgrade head`, then serves on port 8000.
+The worker and beat start once the API is healthy.
 
 ```powershell
 docker compose exec api python -m scripts.seed     # sample centres/tests/prices + the admin user
 docker compose exec api pytest                     # run the test-suite inside the container
-docker compose logs -f api                         # JSON logs
+docker compose logs -f api worker                  # JSON logs
 docker compose down                                # stop (add -v to also delete the database volume)
 ```
 
 ### Option B - without Docker for the API
 
-You need Python 3.11+ and a PostgreSQL server. Easiest: run only the database with Docker
-(`docker compose up -d db`; it matches the `eve:eve@localhost:5432` URLs in `.env.example`).
-Or use your own PostgreSQL and edit `DATABASE_URL` / `TEST_DATABASE_URL` in `.env`.
+You need Python 3.11+, a PostgreSQL server and (optionally) Redis. Easiest: run only the databases with Docker
+(`docker compose up -d db redis`; they match the URLs in `.env.example`).
+Or use your own servers and edit `DATABASE_URL`, `TEST_DATABASE_URL` and `REDIS_URL` in `.env`.
+Leave `REDIS_URL` empty to run without the cache (the Celery worker needs Redis as its broker).
 
 ```powershell
 # PowerShell
@@ -67,6 +71,12 @@ alembic upgrade head                # create the tables
 python -m scripts.seed              # sample data + admin user
 uvicorn app.main:app --reload       # http://localhost:8000/docs
 ```
+Background jobs, in two more terminals (activate the venv in each):
+```powershell
+# PowerShell (Windows: the default prefork pool does not work, so use --pool=solo)
+celery -A app.worker.celery_app worker --loglevel=info --pool=solo
+celery -A app.worker.celery_app beat --loglevel=info
+```
 ```bash
 # bash
 python -m venv .venv && source .venv/bin/activate
@@ -74,7 +84,29 @@ pip install -r requirements.txt
 alembic upgrade head
 python -m scripts.seed
 uvicorn app.main:app --reload
+celery -A app.worker.celery_app worker --loglevel=info      # terminal 2
+celery -A app.worker.celery_app beat --loglevel=info        # terminal 3
 ```
+
+### Configuration (.env)
+
+| Variable | Meaning | Default / example |
+|---|---|---|
+| `DATABASE_URL` | PostgreSQL URL for the API | `postgresql+psycopg2://eve:eve@localhost:5432/eve` |
+| `TEST_DATABASE_URL` | Database the tests use (must end in `_test`, is truncated) | `.../eve_test` |
+| `JWT_SECRET_KEY` | Signs access tokens (required) | long random string |
+| `JWT_ALGORITHM`, `ACCESS_TOKEN_EXPIRE_MINUTES` | Token settings | `HS256`, `60` |
+| `WEBHOOK_SECRET` | Shared secret for the webhook HMAC signature (required) | long random string |
+| `BCRYPT_ROUNDS` | bcrypt cost factor | `12` |
+| `PAYMENT_SUCCESS_RATE` | Chance (0-1) that a payment without `simulate_outcome` succeeds | `0.8` |
+| `RATE_LIMIT_ENABLED`, `RATE_LIMIT_AUTH_PER_MINUTE` | In-memory limit on signup/login per IP | `true`, `10` |
+| `REDIS_URL` | Cache and Celery broker; empty disables the cache | `redis://localhost:6379/0` |
+| `TEST_REDIS_URL` | Redis database the tests use (flushed before each test) | `redis://localhost:6379/15` |
+| `CACHE_TTL_SECONDS` | Lifetime of cached centre responses | `60` |
+| `WEBHOOK_RETRY_BASE_SECONDS`, `WEBHOOK_RETRY_MAX_ATTEMPTS` | First retry delay (doubles each time) and number of retries | `30`, `5` |
+| `PAYMENT_PENDING_TIMEOUT_MINUTES` | `PENDING` payments older than this are failed by the cleanup job | `30` |
+| `LOG_LEVEL` | Log level | `INFO` |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | Admin account created by `python -m scripts.seed` | set both |
 
 ### Migrations
 
@@ -83,7 +115,7 @@ alembic upgrade head                                    # apply all migrations
 alembic revision --autogenerate -m "describe change"    # after editing a model; ALWAYS review the generated file
 alembic downgrade -1                                    # undo the last migration
 ```
-One migration exists: `alembic/versions/0001_initial_schema.py`. A test (`test_migrations.py`) runs `alembic check`
+Two migrations exist: `0001_initial_schema.py` and `0002_webhook_failures.py`. A test (`test_migrations.py`) runs `alembic check`
 and fails if a model changed without a migration.
 
 ### Seed data and the admin user
@@ -99,7 +131,8 @@ pytest            # same command in PowerShell and bash (inside Docker: docker c
 ```
 Tests use a **real PostgreSQL** database named by `TEST_DATABASE_URL` (default `.../eve_test`). It is created
 automatically, built with the Alembic migrations, and **truncated before every test**, so the test setup refuses to run
-unless the database name ends with `_test`. See [Tests](#9-tests).
+unless the database name ends with `_test`. The cache tests use Redis database 15 (`TEST_REDIS_URL`) and are skipped if
+Redis is not running; every other test passes without it. See [Tests](#9-tests).
 
 ---
 
@@ -114,8 +147,8 @@ Authenticated endpoints need `Authorization: Bearer <token>`.
 | `POST /auth/signup` | - | Create account | 201, 409 duplicate email, 422, 429 |
 | `POST /auth/login` | - | Get JWT | 200, 401, 422, 429 |
 | `GET /auth/me` | user | Current user | 200, 401 |
-| `GET /centres/?location=&limit=&offset=` | public | List centres | 200, 422 |
-| `GET /centres/{id}` | public | Centre + its tests and prices | 200, 404, 422 |
+| `GET /centres/?location=&limit=&offset=` | public | List centres (cached, header `X-Cache`) | 200, 422 |
+| `GET /centres/{id}` | public | Centre + its tests and prices (cached) | 200, 404, 422 |
 | `POST /centres/` | admin | Create centre | 201, 401, 403, 409 |
 | `PATCH /centres/{id}` | admin | Update centre | 200, 403, 404, 409 |
 | `PUT /centres/{id}/tests/{test_id}` | admin | Offer a test / change price | 201 created, 200 updated, 403, 404 |
@@ -229,7 +262,7 @@ Responses seen in the real run (same event twice, then a conflicting late event,
 | the same event again | `200 {"status":"already_processed"}` |
 | a new `evt_demo_2` saying FAILED, after SUCCESS | `200 {"status":"ignored","detail":"payment is already SUCCESS; cannot become FAILED"}` |
 | wrong / missing `X-Signature` | `401 {"error":{"code":"invalid_signature",...}}` |
-| unknown `provider_reference` | `404 payment_not_found` |
+| unknown `provider_reference` | `404 payment_not_found` (the event is also stored in `webhook_failures` and retried by Celery) |
 | bad JSON / missing field / status `PENDING` / naive timestamp | `422 invalid_payload` |
 
 After those 3 deliveries the database held **1** payment, **1** booking and **2** `webhook_events` rows.
@@ -248,6 +281,7 @@ erDiagram
     DIAGNOSTIC_TESTS ||--o{ BOOKINGS : "is booked as"
     BOOKINGS ||--o{ PAYMENTS : "is paid by"
     PAYMENTS ||--o{ WEBHOOK_EVENTS : "is updated by"
+    WEBHOOK_FAILURES }o..o| PAYMENTS : "retried until the payment exists"
 
     USERS {
         int id PK
@@ -306,6 +340,19 @@ erDiagram
         text detail
         timestamptz received_at
     }
+    WEBHOOK_FAILURES {
+        int id PK
+        string event_id "indexed"
+        string provider_reference
+        string status
+        timestamptz event_timestamp
+        string reason "payment_not_found or processing_error"
+        text error
+        int attempts
+        timestamptz last_attempt_at
+        timestamptz resolved_at
+        timestamptz created_at
+    }
 ```
 
 **Why the key constraints exist**
@@ -321,7 +368,8 @@ erDiagram
 | `payments.provider_reference` unique | The webhook finds a payment by it; it must identify exactly one payment. |
 | `payments` UNIQUE `(user_id, idempotency_key)` | Client retries cannot create two payments. Scoped **per user** so one user's key can never collide with, or reveal, another user's payment. NULL keys never conflict. |
 | `webhook_events.event_id` UNIQUE | The foundation of webhook idempotency (section 5). |
-| Foreign keys everywhere, all timestamps `timestamptz` | Referential integrity; no naive-time bugs. |
+| `webhook_failures` (no foreign key on purpose) | Stores the raw event of a webhook that could not be processed, including references to payments that do not exist yet. `resolved_at` is set when a retry succeeds. |
+| Foreign keys everywhere else, all timestamps `timestamptz` | Referential integrity; no naive-time bugs. |
 
 ---
 
@@ -411,8 +459,16 @@ Other rules in the same service:
 > everywhere is: booking, or payment -> booking (the webhook), so no cycle can form.
 
 **Provider retries are safe by design.** Because the endpoint is idempotent, a provider can redeliver as often as it likes
-(and should, if it gets a 5xx or a timeout). Failed attempts are logged (`webhook_unknown_payment`,
-`webhook_invalid_signature`, `webhook_ignored`) but not stored in a table, to keep the schema small - see "improve".
+(and should, if it gets a 5xx or a timeout).
+
+**We also retry ourselves (Celery).** A webhook can fail for two reasons: the payment is not visible yet (the provider was
+faster than our commit, answer 404) or something unexpected broke (answer 500). In both cases the verified payload is saved
+in `webhook_failures` (in its own transaction, so it survives the rollback) and a Celery task `retry_webhook` is scheduled.
+The task calls the same idempotent `process_webhook()`, so it can never double-apply an event, even if the provider's own
+retry arrives first. Delays double each time (30s, 60s, 120s, ... via `WEBHOOK_RETRY_BASE_SECONDS`) up to
+`WEBHOOK_RETRY_MAX_ATTEMPTS`; `attempts`, `last_attempt_at`, `error` and `resolved_at` show what happened, and rows that stay
+unresolved are the ones to alert on. The same failing event is stored once, however often the provider redelivers it.
+Invalid signatures and invalid payloads are not stored (they could never succeed).
 
 ### Payments (`app/services/payment_service.py`)
 
@@ -450,9 +506,15 @@ Other rules in the same service:
 * **Rate limiting** is an in-memory sliding window per client IP on signup/login (default 10/min). It is per process
   and sees the proxy's IP behind a reverse proxy; a shared store would be needed in production.
 * **No double-booking / slot-capacity checks:** the same user may book the same slot twice; centres have unlimited capacity.
-* **Redis caching and Celery are deliberately left out.** Nothing here needs them: the centre list is cheap and indexed, and the
-  simulated payment is instantaneous. Adding them would add moving parts (two more services, cache invalidation,
-  task retries) with no measurable benefit, and the assignment prefers a small, well-designed solution.
+* **Redis cache (centre list and detail).** Keys contain a "catalog version" number; every admin write bumps it, so all old
+  entries become unreachable at once and simply expire (TTL `CACHE_TTL_SECONDS`) - no need to find and delete keys. Responses carry
+  `X-Cache: HIT|MISS`. 404s and errors are never cached. If Redis is not configured or is down the cache degrades to a miss and the
+  API works as before (short connect timeouts keep a dead Redis from slowing requests). Bookings and payments are never cached.
+* **Celery** does two jobs: webhook retries (above) and a periodic cleanup (beat, every 5 minutes) that fails payments left `PENDING`
+  longer than `PAYMENT_PENDING_TIMEOUT_MINUTES`: payment -> `FAILED`, booking -> `FAILED` (so the user can pay again; a cancelled
+  booking stays cancelled). A late SUCCESS webhook for an expired payment is ignored by the state rules.
+* Celery tasks stay thin: they open a session and call a service function (`webhook_failure_service.retry_failure`,
+  `maintenance_service.expire_stale_pending_payments`), which is also what the tests call.
 * The `Test` model is called **`DiagnosticTest`** in code (table `diagnostic_tests`) so pytest does not mistake it for a test
   class; the API path is still `/tests/`.
 * Passwords are limited to 72 bytes (a bcrypt limit) and validated for that.
@@ -463,9 +525,9 @@ Other rules in the same service:
 
 * **Real payment gateway:** create a gateway order/intent and rely on its webhooks; verify the provider's timestamp window to stop replay attacks; rotate webhook secrets.
 * **Outbox pattern:** write "booking confirmed" notifications to an outbox table in the same transaction and publish them reliably.
-* **Celery / background jobs:** retry failed webhook processing with backoff, expire stale `PENDING` payments, send e-mail/SMS.
-* **Persist failed webhook attempts** (a `webhook_failures` table or dead-letter queue) for replay and alerting.
-* **Redis:** cache the centre listing (invalidate on admin writes) and move the rate limiter there so it works across instances.
+* **More background jobs:** e-mail/SMS confirmations and reminders, refunds for paid-then-cancelled bookings.
+* **Alerting on exhausted webhook retries** (rows in `webhook_failures` that stay unresolved) and an admin endpoint to replay them.
+* **Move the rate limiter to Redis** so it works across several API instances; cache more read endpoints if they become hot.
 * **Refresh tokens**, logout/token revocation, e-mail verification, password reset, account lockout.
 * **Double-booking and slot-capacity checks**, centre opening hours, rescheduling, refunds for cancelled paid bookings.
 * **Audit log** of status changes (who/when/why) as a table instead of only logs.
@@ -481,12 +543,14 @@ Other rules in the same service:
 app/
   main.py            FastAPI app: middleware, error handlers, routers, /health
   api/               routers (thin) + deps.py (current user, admin check, pagination)
-  core/              config, security (JWT, bcrypt, HMAC), logging, exceptions, middleware, rate limiter
+  core/              config, security (JWT, bcrypt, HMAC), logging, exceptions, middleware, rate limiter, Redis cache
   db/                SQLAlchemy base + session
-  models/            tables (User, Centre, DiagnosticTest, CentreTest, Booking, Payment, WebhookEvent)
+  models/            tables (User, Centre, DiagnosticTest, CentreTest, Booking, Payment, WebhookEvent, WebhookFailure)
   schemas/           Pydantic request/response models
-  services/          business rules: auth, catalog, booking_state (state machine), booking, payment, webhook
-alembic/             migrations (0001_initial_schema)
+  services/          business rules: auth, catalog, booking_state (state machine), booking, payment, webhook,
+                     webhook_failure (store + retry), maintenance (expire stale payments)
+  worker.py          Celery app, tasks and beat schedule
+alembic/             migrations (0001_initial_schema, 0002_webhook_failures)
 scripts/             seed.py, sign_webhook.py
 tests/               pytest suite (real PostgreSQL)
 Dockerfile, docker-compose.yml, .env.example, requirements.txt
@@ -494,10 +558,11 @@ Dockerfile, docker-compose.yml, .env.example, requirements.txt
 
 ## 9. Tests
 
-`pytest` runs **143 tests** (about 5 seconds): auth (incl. expired/forged tokens, rate limit), catalog and admin rules,
+`pytest` runs **171 tests** (about 7 seconds): auth (incl. expired/forged tokens, rate limit), catalog and admin rules,
 bookings, the state machine (every possible transition is checked), payments (incl. idempotency keys and concurrency),
 the webhook (duplicates sent 3 times, 8 concurrent identical deliveries, conflicting events, bad signatures, unknown
-payments, invalid payloads), DB constraints, migrations-in-sync, error format, request-id logging, OpenAPI, and the scripts.
+payments, invalid payloads), the Redis cache (hit/miss, invalidation, Redis down), stored webhook failures and Celery retries,
+the stale-payment cleanup, DB constraints, migrations-in-sync, error format, request-id logging, OpenAPI, and the scripts.
 
 Design of the test setup (`tests/conftest.py`): real PostgreSQL (row locks and unique-constraint races cannot be tested on
 SQLite); schema built by running the real Alembic migration; tables truncated before every test; the setup refuses to run
@@ -506,12 +571,11 @@ on a database whose name does not end in `_test`.
 Every edge case from the assignment has a test - see the checklist at the end of the delivery message and
 `ARCHITECTURE_WALKTHROUGH.md`.
 
-## 10. Verification status (honest notes)
+## 10. Verification status
 
-* Everything was run against **PostgreSQL 16** with Python 3.12: the full test-suite (143 passing, repeated several times
-  to look for flakiness), `alembic upgrade/downgrade/upgrade/check`, the seed script, and a manual end-to-end run against a
-  live `uvicorn` process (the responses in section 2 come from it).
-* I removed the row locks on purpose once to confirm the concurrency tests really fail without them (they did), then restored them.
-* **Not executed:** the `Dockerfile` and `docker-compose.yml` could not be built or run where this was developed (no Docker
-  daemon available). The compose file is syntactically valid YAML and its commands mirror what was run manually, but please run
-  `docker compose up --build` once on your machine and tell me if anything needs adjusting. The image uses Python 3.11; the tests were run on 3.12.
+* Run against **PostgreSQL 16** and **Redis**, Python 3.12: the full test-suite (171 tests), `alembic upgrade/downgrade/upgrade/check`,
+  the seed script, and a manual end-to-end run with a live `uvicorn`, a real Celery worker and Redis (cache MISS/HIT/MISS around a
+  price change, a webhook that arrived before its payment being retried and applied by the worker, and the cleanup task).
+* The concurrency tests fail when the row locks are removed, so they do exercise the locking.
+* `Dockerfile` and `docker-compose.yml` (db, redis, api, worker, beat) were not built in the environment used for development; run
+  `docker compose up --build` once to confirm on your machine. The image uses Python 3.11.
