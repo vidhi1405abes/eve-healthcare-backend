@@ -1,3 +1,12 @@
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql+psycopg2://eve:eve@db:5432/eve
+    TEST_DATABASE_URL: postgresql+psycopg2://eve:eve@db:5432/eve_test
+    REDIS_URL: redis://redis:6379/0
+    TEST_REDIS_URL: redis://redis:6379/15
+
 services:
   db:
     image: postgres:16-alpine
@@ -15,16 +24,24 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
-    build: .
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+psycopg2://eve:eve@db:5432/eve
-      TEST_DATABASE_URL: postgresql+psycopg2://eve:eve@db:5432/eve_test
+    <<: *app
     ports:
       - "8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -32,6 +49,20 @@ services:
       timeout: 5s
       retries: 5
       start_period: 15s
+
+  worker:
+    <<: *app
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    depends_on:
+      api:
+        condition: service_healthy
+
+  beat:
+    <<: *app
+    command: celery -A app.worker.celery_app beat --loglevel=info --schedule /tmp/celerybeat-schedule
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   pgdata:
