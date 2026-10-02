@@ -1,6 +1,6 @@
-from typing import Generic, TypeVar
+from typing import Annotated, Generic, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 T = TypeVar("T")
 
@@ -21,3 +21,8 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+
+
+MAX_ID = 2_147_483_647
+
+PositiveId = Annotated[int, Field(ge=1, le=MAX_ID)]

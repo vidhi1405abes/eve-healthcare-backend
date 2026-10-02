@@ -1,6 +1,7 @@
 from dataclasses import dataclass
+from typing import Annotated
 
-from fastapi import Depends, Query
+from fastapi import Depends, Path, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -8,6 +9,7 @@ from app.core.exceptions import ForbiddenError, UnauthorizedError
 from app.core.security import BEARER_HEADER, decode_access_token
 from app.db.session import get_db
 from app.models import User
+from app.schemas.common import MAX_ID
 
 bearer_scheme = HTTPBearer(auto_error=False, description="Paste the access_token returned by POST /auth/login")
 
@@ -41,3 +43,6 @@ def pagination(
     offset: int = Query(0, ge=0, description="Number of items to skip"),
 ) -> Pagination:
     return Pagination(limit=limit, offset=offset)
+
+
+IdPath = Annotated[int, Path(ge=1, le=MAX_ID, description="Resource id")]
