@@ -1,6 +1,4 @@
-from decimal import Decimal
-
-from app.models import Booking, BookingStatus, CentreTest, DiagnosticTest
+from app.models import Booking, BookingStatus, DiagnosticTest
 from tests.helpers import future_iso, past_iso
 
 
