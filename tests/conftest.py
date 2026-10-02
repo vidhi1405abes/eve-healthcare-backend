@@ -24,6 +24,7 @@ os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-test-jwt-secret-0123456789"
 os.environ["WEBHOOK_SECRET"] = "test-webhook-secret"
 os.environ["BCRYPT_ROUNDS"] = "4"
 os.environ["RATE_LIMIT_ENABLED"] = "false"
+os.environ["REDIS_URL"] = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 os.environ["LOG_LEVEL"] = "WARNING"
 
 import pytest
@@ -31,10 +32,12 @@ from alembic import command
 from alembic.config import Config
 from fastapi.testclient import TestClient
 
+from app.core.cache import cache
 from app.core.rate_limit import auth_limiter
 from app.db.session import SessionLocal, engine
 from app.main import app
 from app.models import Centre, CentreTest, DiagnosticTest, User
+from app.services import webhook_failure_service
 from tests.helpers import auth, future_iso
 
 from decimal import Decimal
@@ -68,12 +71,23 @@ def _clean_database(_schema):
     with engine.begin() as conn:
         conn.execute(
             text(
-                "TRUNCATE TABLE webhook_events, payments, bookings, centre_tests, centres, "
+                "TRUNCATE TABLE webhook_failures, webhook_events, payments, bookings, centre_tests, centres, "
                 "diagnostic_tests, users RESTART IDENTITY CASCADE"
             )
         )
     auth_limiter.reset()
+    try:
+        cache.client.flushdb()
+    except Exception:
+        pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def scheduled_retries(monkeypatch) -> list[int]:
+    scheduled: list[int] = []
+    monkeypatch.setattr(webhook_failure_service, "schedule_retry", scheduled.append)
+    return scheduled
 
 
 @pytest.fixture

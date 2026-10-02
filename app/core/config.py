@@ -18,6 +18,13 @@ class Settings(BaseSettings):
     rate_limit_enabled: bool = True
     rate_limit_auth_per_minute: int = 10
 
+    redis_url: str | None = None
+    cache_ttl_seconds: int = 60
+
+    payment_pending_timeout_minutes: int = 30
+    webhook_retry_max_attempts: int = 5
+    webhook_retry_base_seconds: int = 30
+
     log_level: str = "INFO"
 
     admin_email: str | None = None

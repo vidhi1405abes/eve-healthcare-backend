@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.cache import cache
 from app.core.exceptions import ConflictError, NotFoundError
 from app.models import Centre, CentreTest, DiagnosticTest
 
@@ -104,3 +105,4 @@ def _commit_or_conflict(db: Session, message: str) -> None:
     except IntegrityError:
         db.rollback()
         raise ConflictError(message)
+    cache.invalidate_catalog()

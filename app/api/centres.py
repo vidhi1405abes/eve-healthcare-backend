@@ -1,8 +1,12 @@
+from collections.abc import Callable
+
 from fastapi import APIRouter, Depends, Query, Response
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import IdPath, Pagination, pagination, require_admin
 from app.api.docs import error_responses
+from app.core.cache import cache
 from app.db.session import get_db
 from app.models import Centre
 from app.schemas.catalog import (
@@ -33,20 +37,38 @@ def _to_detail(centre: Centre) -> CentreDetailOut:
     )
 
 
+def _cached(key: str | None, build: Callable[[], BaseModel]) -> Response:
+    cached = cache.get(key)
+    if cached is not None:
+        return Response(cached, media_type="application/json", headers={"X-Cache": "HIT"})
+    body = build().model_dump_json()
+    cache.set(key, body)
+    return Response(body, media_type="application/json", headers={"X-Cache": "MISS"})
+
+
 @router.get(
     "/",
     response_model=Page[CentreOut],
     summary="List centres (public)",
-    description="Paginated. `location` does a case-insensitive 'contains' match, e.g. `del` matches `Delhi`.",
+    description="Paginated. `location` does a case-insensitive 'contains' match, e.g. `del` matches `Delhi`. "
+    "Cached in Redis (header `X-Cache: HIT` or `MISS`); admin writes invalidate the cache.",
     responses=error_responses(422),
 )
 def list_centres(
     location: str | None = Query(None, max_length=120, description="Filter by location", examples=["Delhi"]),
     page: Pagination = Depends(pagination),
     db: Session = Depends(get_db),
-) -> Page[CentreOut]:
-    items, total = catalog_service.list_centres(db, page.limit, page.offset, location)
-    return Page(items=items, total=total, limit=page.limit, offset=page.offset)
+) -> Response:
+    def build() -> Page[CentreOut]:
+        items, total = catalog_service.list_centres(db, page.limit, page.offset, location)
+        return Page(
+            items=[CentreOut.model_validate(centre) for centre in items],
+            total=total,
+            limit=page.limit,
+            offset=page.offset,
+        )
+
+    return _cached(cache.key("list", (location or "").lower(), page.limit, page.offset), build)
 
 
 @router.get(
@@ -55,8 +77,11 @@ def list_centres(
     summary="Get a centre with the tests it offers and their prices (public)",
     responses=error_responses(404, 422),
 )
-def get_centre(centre_id: IdPath, db: Session = Depends(get_db)) -> CentreDetailOut:
-    return _to_detail(catalog_service.get_centre_with_tests(db, centre_id))
+def get_centre(centre_id: IdPath, db: Session = Depends(get_db)) -> Response:
+    return _cached(
+        cache.key("detail", centre_id),
+        lambda: _to_detail(catalog_service.get_centre_with_tests(db, centre_id)),
+    )
 
 
 @router.post(
