@@ -4,6 +4,7 @@ from app.models.enums import BookingStatus, PaymentStatus, WebhookOutcome
 from app.models.payment import Payment
 from app.models.user import User
 from app.models.webhook_event import WebhookEvent
+from app.models.webhook_failure import WebhookFailure
 
 __all__ = [
     "Booking",
@@ -15,5 +16,6 @@ __all__ = [
     "PaymentStatus",
     "User",
     "WebhookEvent",
+    "WebhookFailure",
     "WebhookOutcome",
 ]

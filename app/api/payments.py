@@ -6,13 +6,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.api.docs import error_responses
-from app.core.exceptions import InvalidPayloadError, UnauthorizedError
+from app.core.exceptions import AppError, InvalidPayloadError, NotFoundError, UnauthorizedError
 from app.core.security import verify_webhook_signature
 from app.db.session import get_db
 from app.models import Payment, User
 from app.schemas.payment import PaymentCreate, PaymentOut
 from app.schemas.webhook import WebhookPayload, WebhookResponse
-from app.services import payment_service, webhook_service
+from app.services import payment_service, webhook_failure_service, webhook_service
 
 logger = logging.getLogger("app.webhook")
 router = APIRouter(prefix="/payments", tags=["payments"])
@@ -77,7 +77,9 @@ async def read_raw_body(request: Request) -> bytes:
         "* Same `event_id` delivered again -> `200 {\"status\": \"already_processed\"}`, nothing changes.\n"
         "* Event that conflicts with the current state (e.g. late FAILED after SUCCESS) -> `200` `ignored`.\n"
         "* Always 2xx for events we have seen, so the provider can retry safely.\n"
-        "* Missing/invalid signature -> 401. Unknown `provider_reference` -> 404. Invalid body -> 422."
+        "* Missing/invalid signature -> 401. Unknown `provider_reference` -> 404. Invalid body -> 422.\n"
+        "* A 404 (payment not visible yet) or an unexpected error is stored in `webhook_failures` and retried "
+        "in the background by Celery with exponential backoff."
     ),
     openapi_extra={"requestBody": WEBHOOK_REQUEST_BODY},
     responses=error_responses(401, 404, 422),
@@ -97,5 +99,14 @@ def payment_webhook(
         problems = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
         raise InvalidPayloadError(f"Invalid webhook payload ({problems})")
 
-    result = webhook_service.process_webhook(db, payload)
+    try:
+        result = webhook_service.process_webhook(db, payload)
+    except NotFoundError:
+        webhook_failure_service.keep_for_retry(payload, "payment_not_found", None)
+        raise
+    except AppError:
+        raise
+    except Exception as exc:
+        webhook_failure_service.keep_for_retry(payload, "processing_error", repr(exc)[:500])
+        raise
     return WebhookResponse(status=result.status, detail=result.detail)
